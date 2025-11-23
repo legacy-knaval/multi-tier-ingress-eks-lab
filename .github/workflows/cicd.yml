@@ -1,0 +1,169 @@
+name: CI/CD to EKS (Docker Hub + buildx)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  # Common env you may use across jobs
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  K8S_NAMESPACE: ${{ secrets.K8S_NAMESPACE }}
+  DOCKER_ORG: ${{ secrets.DOCKER_ORG }}
+  STUDENT_NAME: ${{ secrets.STUDENT_NAME }}
+  INGRESS_HOST: ${{ secrets.INGRESS_HOST }}
+
+jobs:
+  build-and-push:
+    name: Build & Push Images (backend + frontend)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - backend
+          - frontend
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker login (Docker Hub)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up QEMU (for optional multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Assign a short tag based on the commit SHA (immutable) + also push "latest"
+      - name: Define image meta
+        id: meta
+        run: |
+          SHA_TAG=${GITHUB_SHA::7}
+          echo "sha_tag=$SHA_TAG" >> $GITHUB_OUTPUT
+          # Image names: DOCKER_ORG/lab-backend, DOCKER_ORG/lab-frontend
+          if [ "${{ matrix.app }}" = "backend" ]; then
+            echo "image=${{ env.DOCKER_ORG }}/lab-backend" >> $GITHUB_OUTPUT
+            echo "context=./backend" >> $GITHUB_OUTPUT
+          else
+            echo "image=${{ env.DOCKER_ORG }}/lab-frontend" >> $GITHUB_OUTPUT
+            echo "context=./frontend" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build & Push with buildx (cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.meta.outputs.context }}
+          file: ${{ steps.meta.outputs.context }}/Dockerfile
+          push: true
+          # uncomment for true multi-arch class demos:
+          # platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: [ build-and-push ]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (keys-based for this lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Verify access
+        run: |
+          kubectl version --short
+          kubectl get ns
+          kubectl get ingress -A || true
+
+      # Ensure namespace exists (idempotent for students)
+      - name: Create namespace if missing
+        run: |
+          kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
+
+      # Optional: (re)apply your k8s base manifests from the previous lab
+      # This guarantees services/ingress exist even on a new cluster
+      - name: Apply base k8s (safe re-apply)
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -n "$K8S_NAMESPACE" -f k8s/backend-service.yaml
+          kubectl apply -n "$K8S_NAMESPACE" -f k8s/frontend-service.yaml
+          kubectl apply -n "$K8S_NAMESPACE" -f k8s/ingress.yaml
+
+      # Update deployments to the newly-pushed images using this commit's SHA
+      - name: Compute image tags
+        id: tag
+        run: |
+          SHA_TAG=${GITHUB_SHA::7}
+          echo "sha_tag=$SHA_TAG" >> $GITHUB_OUTPUT
+          echo "backend_image=${DOCKER_ORG}/lab-backend:${SHA_TAG}" >> $GITHUB_OUTPUT
+          echo "frontend_image=${DOCKER_ORG}/lab-frontend:${SHA_TAG}" >> $GITHUB_OUTPUT
+
+      # If it's the students' first CI deploy, also apply the deployments once
+      - name: Ensure deployments exist (first-time rollout)
+        run: |
+          # If these files exist from prior lab, you can re-apply safely.
+          # They must declare metadata.name: backend / frontend
+          kubectl apply -n "$K8S_NAMESPACE" -f k8s/backend-deployment.yaml
+          kubectl apply -n "$K8S_NAMESPACE" -f k8s/frontend-deployment.yaml
+
+      - name: Set images to new SHA tag
+        run: |
+          kubectl -n "$K8S_NAMESPACE" set image deployment/backend backend="${{ steps.tag.outputs.backend_image }}"
+          kubectl -n "$K8S_NAMESPACE" set image deployment/frontend frontend="${{ steps.tag.outputs.frontend_image }}"
+
+      # Make sure the ingress host matches your Route 53 record (idempotent patch)
+      - name: Patch Ingress host if needed
+        shell: bash
+        run: |
+          # Reads, checks, and patches host in-place.
+          CURRENT_HOST=$(kubectl -n "$K8S_NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}')
+          if [ "$CURRENT_HOST" != "$INGRESS_HOST" ]; then
+            echo "Patching ingress host to $INGRESS_HOST"
+            kubectl -n "$K8S_NAMESPACE" patch ingress $(kubectl -n "$K8S_NAMESPACE" get ingress -o jsonpath='{.items[0].metadata.name}') \
+              --type='json' \
+              -p="[ {\"op\": \"replace\", \"path\": \"/spec/rules/0/host\", \"value\": \"${INGRESS_HOST}\" } ]"
+          else
+            echo "Ingress already points to $INGRESS_HOST"
+          fi
+
+      - name: Wait for rollout (backend)
+        run: |
+          kubectl -n "$K8S_NAMESPACE" rollout status deploy/backend --timeout=120s
+
+      - name: Wait for rollout (frontend)
+        run: |
+          kubectl -n "$K8S_NAMESPACE" rollout status deploy/frontend --timeout=120s
+
+      - name: Quick smoke test via Ingress
+        run: |
+          # You need DNS already pointing at the NGINX Ingress ELB (previous lab).
+          # Test the API route:
+          curl -s --fail "http://${INGRESS_HOST}/api/ping" | tee /tmp/api.txt
+          echo
+          echo "Response above should contain a ping or message from backend."
+
