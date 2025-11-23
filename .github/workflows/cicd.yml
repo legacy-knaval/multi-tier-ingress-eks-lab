@@ -96,7 +96,7 @@ jobs:
 
       - name: Verify access
         run: |
-          kubectl version --short
+          kubectl version --client=true
           kubectl get ns
           kubectl get ingress -A || true
 
